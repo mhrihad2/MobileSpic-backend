@@ -1,0 +1,29 @@
+This backend folder is ready to download and upload.
+
+Required files are already inside this folder:
+
+- server.js
+- package.json
+- .env
+- .env.example
+- README.md
+- public/README.txt
+
+How to run:
+
+1. Open terminal inside backend folder.
+2. Run: npm install
+3. Run: npm start
+4. Open: http://localhost:4000/api/health
+
+If you want this backend to also show the frontend website:
+
+1. In the main project run: npm run build
+2. Copy all files from dist/ into backend/public/
+3. Run backend again: npm start
+4. Open: http://localhost:4000
+
+Important:
+- Do not upload .env to public GitHub.
+- On Render/Railway, add .env values in Environment Variables.
+- Your database password and Cloudinary secret were shared in chat, rotate them before final public launch.
