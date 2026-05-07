@@ -185,7 +185,6 @@ async function initTables() {
 
   // ================= EXISTING TABLE COLUMN FIXES =================
 
-  // ✅ NEW: username column add
   await pool.query(`
     ALTER TABLE users 
     ADD COLUMN IF NOT EXISTS username TEXT DEFAULT '';
@@ -381,25 +380,27 @@ async function initTables() {
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
   `);
 
-  // ================= ADMIN FIX =================
-
-  await pool.query(
-    `UPDATE users SET role = 'ADMIN' WHERE email = $1`,
-    [ADMIN_EMAIL]
-  );
+  // ================= ADMIN FIX (FIXED!) =================
 
   const admin = await pool.query(
     "SELECT id FROM users WHERE email = $1",
     [ADMIN_EMAIL]
   );
 
+  const hashed = await bcrypt.hash(ADMIN_PASSWORD, 12);
+
   if (admin.rows.length === 0) {
-    const hashed = await bcrypt.hash(ADMIN_PASSWORD, 12);
     await pool.query(
       "INSERT INTO users (email, username, password, role) VALUES ($1, $2, $3, $4)",
       [ADMIN_EMAIL, ADMIN_USERNAME, hashed, "ADMIN"]
     );
     console.log(`Created admin user: ${ADMIN_EMAIL}`);
+  } else {
+    await pool.query(
+      "UPDATE users SET password = $1, role = 'ADMIN', username = $2 WHERE email = $3",
+      [hashed, ADMIN_USERNAME, ADMIN_EMAIL]
+    );
+    console.log(`Admin password reset done ✅`);
   }
 
   console.log("Database tables checked successfully ✅");
@@ -444,7 +445,6 @@ function mapPhone(row) {
   };
 }
 
-// ✅ FIXED: signToken - now includes username
 function signToken(user) {
   return jwt.sign(
     {
@@ -520,14 +520,12 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// ✅ FIXED: Login - now works with both email and username
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password required" });
   }
   try {
-    // Email OR Username diye login korte parbe
     const result = await pool.query(
       "SELECT * FROM users WHERE email = $1 OR username = $1",
       [email]
@@ -583,15 +581,12 @@ app.get("/profile", verifyToken, async (req, res) => {
   }
 });
 
-// =====================================================
-// ✅✅✅ NEW: PROFILE UPDATE - এটাই MAIN FIX ✅✅✅
-// =====================================================
+// ================= PROFILE UPDATE =================
 
 app.put("/api/profile/update", verifyToken, async (req, res) => {
   const { email, username, newPassword, currentPassword } = req.body;
 
   try {
-    // Step 1: আগের user data আনো
     const userResult = await pool.query(
       "SELECT * FROM users WHERE id = $1",
       [req.user.id]
@@ -603,17 +598,15 @@ app.put("/api/profile/update", verifyToken, async (req, res) => {
 
     const currentUser = userResult.rows[0];
 
-    // Step 2: Current password verify করো
     if (!currentPassword) {
       return res.status(400).json({ error: "Current password is required" });
     }
 
     const isMatch = await bcrypt.compare(currentPassword, currentUser.password);
     if (!isMatch) {
-      return res.status(401).json({ error: "Current password is wrong ❌" });
+      return res.status(401).json({ error: "Current password is wrong" });
     }
 
-    // Step 3: নতুন email already আছে কিনা check করো
     if (email && email !== currentUser.email) {
       const emailExists = await pool.query(
         "SELECT id FROM users WHERE email = $1 AND id != $2",
@@ -624,31 +617,24 @@ app.put("/api/profile/update", verifyToken, async (req, res) => {
       }
     }
 
-    // Step 4: নতুন username already আছে কিনা check করো
     if (username && username !== currentUser.username) {
       const usernameExists = await pool.query(
         "SELECT id FROM users WHERE username = $1 AND id != $2",
         [username, req.user.id]
       );
       if (usernameExists.rows.length > 0) {
-        return res
-          .status(409)
-          .json({ error: "This username is already taken" });
+        return res.status(409).json({ error: "This username is already taken" });
       }
     }
 
-    // Step 5: Update values prepare করো
     const updatedEmail = email || currentUser.email;
-    const updatedUsername =
-      username !== undefined ? username : currentUser.username || "";
+    const updatedUsername = username !== undefined ? username : currentUser.username || "";
 
-    // ✅ PASSWORD HASH - এটাই MAIN FIX!
     let updatedPassword = currentUser.password;
     if (newPassword && newPassword.trim() !== "") {
       updatedPassword = await bcrypt.hash(newPassword, 12);
     }
 
-    // Step 6: Database update করো
     const updated = await pool.query(
       `UPDATE users 
        SET email = $1, username = $2, password = $3 
@@ -658,8 +644,6 @@ app.put("/api/profile/update", verifyToken, async (req, res) => {
     );
 
     const updatedUser = updated.rows[0];
-
-    // ✅ Step 7: নতুন TOKEN তৈরি করো - এটাও IMPORTANT!
     const newToken = signToken(updatedUser);
 
     res.json({
@@ -678,9 +662,7 @@ app.put("/api/profile/update", verifyToken, async (req, res) => {
   }
 });
 
-// =====================================================
-// ✅✅✅ NEW: ADMIN - force password reset (optional)
-// =====================================================
+// ================= ADMIN PASSWORD RESET =================
 
 app.put(
   "/api/admin/reset-password/:userId",
@@ -691,7 +673,6 @@ app.put(
     if (!newPassword) {
       return res.status(400).json({ error: "New password required" });
     }
-
     try {
       const hashedPassword = await bcrypt.hash(newPassword, 12);
       await pool.query("UPDATE users SET password = $1 WHERE id = $2", [
@@ -746,105 +727,41 @@ app.get("/api/public/bootstrap", async (req, res) => {
       LEFT JOIN brands ON brands.id = phones.brand_id
       ORDER BY phones.created_at DESC
     `),
-    pool.query(
-      "SELECT * FROM articles WHERE status = 'published' ORDER BY created_at DESC"
-    ),
-    pool.query(
-      "SELECT * FROM pages WHERE status = 'published' ORDER BY created_at DESC"
-    ),
-    pool.query(
-      "SELECT * FROM ads WHERE active = true ORDER BY created_at DESC"
-    ),
-    pool.query(
-      "SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC"
-    ),
+    pool.query("SELECT * FROM articles WHERE status = 'published' ORDER BY created_at DESC"),
+    pool.query("SELECT * FROM pages WHERE status = 'published' ORDER BY created_at DESC"),
+    pool.query("SELECT * FROM ads WHERE active = true ORDER BY created_at DESC"),
+    pool.query("SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC"),
     pool.query("SELECT * FROM filter_options ORDER BY id ASC"),
-    pool.query(
-      "SELECT * FROM menu_items ORDER BY sort_order ASC, id ASC"
-    ),
+    pool.query("SELECT * FROM menu_items ORDER BY sort_order ASC, id ASC"),
     pool.query("SELECT * FROM submenu_items ORDER BY id ASC"),
-    pool.query(
-      "SELECT * FROM carousel_slides WHERE active = true ORDER BY sort_order ASC, id ASC"
-    ),
+    pool.query("SELECT * FROM carousel_slides WHERE active = true ORDER BY sort_order ASC, id ASC"),
     pool.query("SELECT * FROM page_visits"),
   ]);
 
   const optionsByGroup = filterOptions.rows.reduce((acc, row) => {
     const groupId = String(row.filter_group_id);
     acc[groupId] ||= [];
-    acc[groupId].push({
-      id: String(row.id),
-      label: row.label,
-    });
+    acc[groupId].push({ id: String(row.id), label: row.label });
     return acc;
   }, {});
 
   const submenusByMenu = submenus.rows.reduce((acc, row) => {
     const menuId = String(row.menu_item_id);
     acc[menuId] ||= [];
-    acc[menuId].push({
-      id: String(row.id),
-      title: row.title,
-      url: row.url,
-      enabled: row.enabled,
-    });
+    acc[menuId].push({ id: String(row.id), title: row.title, url: row.url, enabled: row.enabled });
     return acc;
   }, {});
 
   res.json({
-    brands: brands.rows.map((row) => ({
-      id: String(row.id),
-      name: row.name,
-      slug: row.slug,
-      logoUrl: row.logo_url || "",
-    })),
+    brands: brands.rows.map((row) => ({ id: String(row.id), name: row.name, slug: row.slug, logoUrl: row.logo_url || "" })),
     phones: phones.rows.map(mapPhone),
-    articles: articles.rows.map((row) => ({
-      ...mapId(row),
-      imageUrl: row.image_url || "",
-    })),
-    pages: pages.rows.map((row) => ({
-      ...mapId(row),
-      showInFooter: row.show_in_footer,
-      showInHeader: row.show_in_header,
-    })),
-    ads: ads.rows.map((row) => ({
-      ...mapId(row),
-      imageUrl: row.image_url || "",
-      adCode: row.ad_code || "",
-    })),
-    filters: filterGroups.rows.map((row) => ({
-      id: String(row.id),
-      name: row.name,
-      type: row.type,
-      enabled: row.enabled,
-      order: row.sort_order,
-      options: optionsByGroup[String(row.id)] || [],
-    })),
-    menuItems: menuItems.rows.map((row) => ({
-      id: String(row.id),
-      title: row.title,
-      url: row.url,
-      location: row.location,
-      enabled: row.enabled,
-      order: row.sort_order,
-      submenus: submenusByMenu[String(row.id)] || [],
-    })),
-    carouselSlides: carouselSlides.rows.map((row) => ({
-      id: String(row.id),
-      title: row.title,
-      subtitle: row.subtitle,
-      imageUrl: row.image_url || "",
-      link: row.link,
-      color: row.color,
-      active: row.active,
-      order: row.sort_order,
-    })),
-    pageVisits: visits.rows.map((row) => ({
-      pageId: String(row.page_id),
-      visits: row.visits,
-      lastVisited: row.last_visited,
-    })),
+    articles: articles.rows.map((row) => ({ ...mapId(row), imageUrl: row.image_url || "" })),
+    pages: pages.rows.map((row) => ({ ...mapId(row), showInFooter: row.show_in_footer, showInHeader: row.show_in_header })),
+    ads: ads.rows.map((row) => ({ ...mapId(row), imageUrl: row.image_url || "", adCode: row.ad_code || "" })),
+    filters: filterGroups.rows.map((row) => ({ id: String(row.id), name: row.name, type: row.type, enabled: row.enabled, order: row.sort_order, options: optionsByGroup[String(row.id)] || [] })),
+    menuItems: menuItems.rows.map((row) => ({ id: String(row.id), title: row.title, url: row.url, location: row.location, enabled: row.enabled, order: row.sort_order, submenus: submenusByMenu[String(row.id)] || [] })),
+    carouselSlides: carouselSlides.rows.map((row) => ({ id: String(row.id), title: row.title, subtitle: row.subtitle, imageUrl: row.image_url || "", link: row.link, color: row.color, active: row.active, order: row.sort_order })),
+    pageVisits: visits.rows.map((row) => ({ pageId: String(row.page_id), visits: row.visits, lastVisited: row.last_visited })),
   });
 });
 
@@ -852,31 +769,18 @@ app.get("/api/public/bootstrap", async (req, res) => {
 
 app.get("/api/brands", async (req, res) => {
   const rows = await pool.query("SELECT * FROM brands ORDER BY name ASC");
-  res.json(
-    rows.rows.map((row) => ({
-      id: String(row.id),
-      name: row.name,
-      slug: row.slug,
-      logoUrl: row.logo_url || "",
-    }))
-  );
+  res.json(rows.rows.map((row) => ({ id: String(row.id), name: row.name, slug: row.slug, logoUrl: row.logo_url || "" })));
 });
 
 app.post("/api/brands", verifyToken, verifyAdmin, async (req, res) => {
   const { name, slug, logoUrl } = req.body;
-  const created = await pool.query(
-    "INSERT INTO brands (name, slug, logo_url) VALUES ($1, $2, $3) RETURNING *",
-    [name, slug, logoUrl || null]
-  );
+  const created = await pool.query("INSERT INTO brands (name, slug, logo_url) VALUES ($1, $2, $3) RETURNING *", [name, slug, logoUrl || null]);
   res.json(mapId(created.rows[0]));
 });
 
 app.put("/api/brands/:id", verifyToken, verifyAdmin, async (req, res) => {
   const { name, slug, logoUrl } = req.body;
-  const updated = await pool.query(
-    "UPDATE brands SET name=$1, slug=$2, logo_url=$3, updated_at=NOW() WHERE id=$4 RETURNING *",
-    [name, slug, logoUrl || null, req.params.id]
-  );
+  const updated = await pool.query("UPDATE brands SET name=$1, slug=$2, logo_url=$3, updated_at=NOW() WHERE id=$4 RETURNING *", [name, slug, logoUrl || null, req.params.id]);
   res.json(mapId(updated.rows[0]));
 });
 
@@ -889,84 +793,27 @@ app.delete("/api/brands/:id", verifyToken, verifyAdmin, async (req, res) => {
 
 app.get("/api/phones", async (req, res) => {
   const rows = await pool.query(`
-    SELECT phones.*, 
-           brands.name AS brand_name, 
-           brands.slug AS brand_slug, 
-           brands.logo_url AS brand_logo_url
-    FROM phones 
-    LEFT JOIN brands ON brands.id = phones.brand_id
+    SELECT phones.*, brands.name AS brand_name, brands.slug AS brand_slug, brands.logo_url AS brand_logo_url
+    FROM phones LEFT JOIN brands ON brands.id = phones.brand_id
     ORDER BY phones.created_at DESC
   `);
   res.json(rows.rows.map(mapPhone));
 });
 
 app.post("/api/phones", verifyToken, verifyAdmin, async (req, res) => {
-  const {
-    name,
-    brandId,
-    price,
-    originalPrice,
-    imageUrl,
-    images,
-    status,
-    type,
-    specs,
-    rating,
-  } = req.body;
+  const { name, brandId, price, originalPrice, imageUrl, images, status, type, specs, rating } = req.body;
   const created = await pool.query(
-    `INSERT INTO phones 
-    (name, brand_id, price, original_price, image_url, images, status, type, specs, rating)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-    RETURNING *`,
-    [
-      name,
-      brandId || null,
-      price || 0,
-      originalPrice || null,
-      imageUrl || null,
-      images || [],
-      status || "official",
-      type || "smartphone",
-      specs || {},
-      rating || 0,
-    ]
+    `INSERT INTO phones (name, brand_id, price, original_price, image_url, images, status, type, specs, rating) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [name, brandId || null, price || 0, originalPrice || null, imageUrl || null, images || [], status || "official", type || "smartphone", specs || {}, rating || 0]
   );
   res.json(mapPhone(created.rows[0]));
 });
 
 app.put("/api/phones/:id", verifyToken, verifyAdmin, async (req, res) => {
-  const {
-    name,
-    brandId,
-    price,
-    originalPrice,
-    imageUrl,
-    images,
-    status,
-    type,
-    specs,
-    rating,
-  } = req.body;
+  const { name, brandId, price, originalPrice, imageUrl, images, status, type, specs, rating } = req.body;
   const updated = await pool.query(
-    `UPDATE phones 
-    SET name=$1, brand_id=$2, price=$3, original_price=$4, 
-        image_url=$5, images=$6, status=$7, type=$8, 
-        specs=$9, rating=$10, updated_at=NOW()
-    WHERE id=$11
-    RETURNING *`,
-    [
-      name,
-      brandId || null,
-      price || 0,
-      originalPrice || null,
-      imageUrl || null,
-      images || [],
-      status || "official",
-      type || "smartphone",
-      specs || {},
-      rating || 0,
-      req.params.id,
-    ]
+    `UPDATE phones SET name=$1, brand_id=$2, price=$3, original_price=$4, image_url=$5, images=$6, status=$7, type=$8, specs=$9, rating=$10, updated_at=NOW() WHERE id=$11 RETURNING *`,
+    [name, brandId || null, price || 0, originalPrice || null, imageUrl || null, images || [], status || "official", type || "smartphone", specs || {}, rating || 0, req.params.id]
   );
   res.json(mapPhone(updated.rows[0]));
 });
@@ -980,52 +827,29 @@ app.delete("/api/phones/:id", verifyToken, verifyAdmin, async (req, res) => {
 
 function simpleCrud(path, table, columns) {
   app.get(`/api/${path}`, async (req, res) => {
-    const rows = await pool.query(
-      `SELECT * FROM ${table} ORDER BY created_at DESC`
-    );
+    const rows = await pool.query(`SELECT * FROM ${table} ORDER BY created_at DESC`);
     res.json(rows.rows.map(mapId));
   });
 
   app.post(`/api/${path}`, verifyToken, verifyAdmin, async (req, res) => {
-    const values = columns.map(
-      (col) => req.body[col.camel] ?? col.default ?? null
-    );
+    const values = columns.map((col) => req.body[col.camel] ?? col.default ?? null);
     const names = columns.map((col) => col.db).join(", ");
-    const placeholders = columns
-      .map((_, index) => `$${index + 1}`)
-      .join(", ");
-    const created = await pool.query(
-      `INSERT INTO ${table} (${names}) VALUES (${placeholders}) RETURNING *`,
-      values
-    );
+    const placeholders = columns.map((_, index) => `$${index + 1}`).join(", ");
+    const created = await pool.query(`INSERT INTO ${table} (${names}) VALUES (${placeholders}) RETURNING *`, values);
     res.json(mapId(created.rows[0]));
   });
 
   app.put(`/api/${path}/:id`, verifyToken, verifyAdmin, async (req, res) => {
-    const values = columns.map(
-      (col) => req.body[col.camel] ?? col.default ?? null
-    );
-    const setSql = columns
-      .map((col, index) => `${col.db}=$${index + 1}`)
-      .join(", ");
-    const updated = await pool.query(
-      `UPDATE ${table} SET ${setSql}, updated_at=NOW() WHERE id=$${
-        columns.length + 1
-      } RETURNING *`,
-      [...values, req.params.id]
-    );
+    const values = columns.map((col) => req.body[col.camel] ?? col.default ?? null);
+    const setSql = columns.map((col, index) => `${col.db}=$${index + 1}`).join(", ");
+    const updated = await pool.query(`UPDATE ${table} SET ${setSql}, updated_at=NOW() WHERE id=$${columns.length + 1} RETURNING *`, [...values, req.params.id]);
     res.json(mapId(updated.rows[0]));
   });
 
-  app.delete(
-    `/api/${path}/:id`,
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-      await pool.query(`DELETE FROM ${table} WHERE id=$1`, [req.params.id]);
-      res.json({ ok: true });
-    }
-  );
+  app.delete(`/api/${path}/:id`, verifyToken, verifyAdmin, async (req, res) => {
+    await pool.query(`DELETE FROM ${table} WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  });
 }
 
 // ================= ARTICLES =================
@@ -1076,80 +900,43 @@ simpleCrud("carousel", "carousel_slides", [
 // ================= FILTERS =================
 
 app.get("/api/filters", async (req, res) => {
-  const groups = await pool.query(
-    "SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC"
-  );
-  const options = await pool.query(
-    "SELECT * FROM filter_options ORDER BY id ASC"
-  );
-  res.json(
-    groups.rows.map((group) => ({
-      id: String(group.id),
-      name: group.name,
-      type: group.type,
-      enabled: group.enabled,
-      options: options.rows
-        .filter((option) => option.filter_group_id === group.id)
-        .map((option) => ({
-          id: String(option.id),
-          label: option.label,
-        })),
-    }))
-  );
+  const groups = await pool.query("SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC");
+  const options = await pool.query("SELECT * FROM filter_options ORDER BY id ASC");
+  res.json(groups.rows.map((group) => ({
+    id: String(group.id), name: group.name, type: group.type, enabled: group.enabled,
+    options: options.rows.filter((option) => option.filter_group_id === group.id).map((option) => ({ id: String(option.id), label: option.label })),
+  })));
 });
 
 app.post("/api/filters", verifyToken, verifyAdmin, async (req, res) => {
   const { name, type = "tags", enabled = true, options = [] } = req.body;
-  const group = await pool.query(
-    "INSERT INTO filter_groups (name, type, enabled) VALUES ($1,$2,$3) RETURNING *",
-    [name, type, enabled]
-  );
+  const group = await pool.query("INSERT INTO filter_groups (name, type, enabled) VALUES ($1,$2,$3) RETURNING *", [name, type, enabled]);
   for (const option of options) {
-    await pool.query(
-      "INSERT INTO filter_options (filter_group_id, label) VALUES ($1,$2)",
-      [group.rows[0].id, option.label || option]
-    );
+    await pool.query("INSERT INTO filter_options (filter_group_id, label) VALUES ($1,$2)", [group.rows[0].id, option.label || option]);
   }
   res.json(mapId(group.rows[0]));
 });
 
 app.put("/api/filters/:id", verifyToken, verifyAdmin, async (req, res) => {
   const { name, type = "tags", enabled = true, options = [] } = req.body;
-  const group = await pool.query(
-    "UPDATE filter_groups SET name=$1, type=$2, enabled=$3, updated_at=NOW() WHERE id=$4 RETURNING *",
-    [name, type, enabled, req.params.id]
-  );
-  await pool.query("DELETE FROM filter_options WHERE filter_group_id=$1", [
-    req.params.id,
-  ]);
+  const group = await pool.query("UPDATE filter_groups SET name=$1, type=$2, enabled=$3, updated_at=NOW() WHERE id=$4 RETURNING *", [name, type, enabled, req.params.id]);
+  await pool.query("DELETE FROM filter_options WHERE filter_group_id=$1", [req.params.id]);
   for (const option of options) {
-    await pool.query(
-      "INSERT INTO filter_options (filter_group_id, label) VALUES ($1,$2)",
-      [req.params.id, option.label || option]
-    );
+    await pool.query("INSERT INTO filter_options (filter_group_id, label) VALUES ($1,$2)", [req.params.id, option.label || option]);
   }
   res.json(mapId(group.rows[0]));
 });
 
-app.delete(
-  "/api/filters/:id",
-  verifyToken,
-  verifyAdmin,
-  async (req, res) => {
-    await pool.query("DELETE FROM filter_groups WHERE id=$1", [req.params.id]);
-    res.json({ ok: true });
-  }
-);
+app.delete("/api/filters/:id", verifyToken, verifyAdmin, async (req, res) => {
+  await pool.query("DELETE FROM filter_groups WHERE id=$1", [req.params.id]);
+  res.json({ ok: true });
+});
 
 // ================= VISITS =================
 
 app.post("/api/visits/:pageId", async (req, res) => {
   const visit = await pool.query(
-    `INSERT INTO page_visits (page_id, visits, last_visited)
-    VALUES ($1, 1, NOW())
-    ON CONFLICT (page_id)
-    DO UPDATE SET visits = page_visits.visits + 1, last_visited = NOW()
-    RETURNING *`,
+    `INSERT INTO page_visits (page_id, visits, last_visited) VALUES ($1, 1, NOW()) ON CONFLICT (page_id) DO UPDATE SET visits = page_visits.visits + 1, last_visited = NOW() RETURNING *`,
     [req.params.pageId]
   );
   res.json(toCamel(visit.rows[0]));
