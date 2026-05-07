@@ -12,9 +12,12 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@mobilespic.com";
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
 
-const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173,http://localhost:3000")
+const allowedOrigins = (
+  process.env.CORS_ORIGIN || "http://localhost:5173,http://localhost:3000"
+)
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
@@ -34,7 +37,6 @@ app.use(
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-
       return callback(new Error(`CORS blocked origin: ${origin}`));
     },
     credentials: true,
@@ -56,6 +58,7 @@ async function initTables() {
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
+      username TEXT DEFAULT '',
       password TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'USER',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -181,6 +184,12 @@ async function initTables() {
   `);
 
   // ================= EXISTING TABLE COLUMN FIXES =================
+
+  // ✅ NEW: username column add
+  await pool.query(`
+    ALTER TABLE users 
+    ADD COLUMN IF NOT EXISTS username TEXT DEFAULT '';
+  `);
 
   await pool.query(`
     ALTER TABLE users 
@@ -374,13 +383,11 @@ async function initTables() {
 
   // ================= ADMIN FIX =================
 
-  // যদি admin email আগে normal user হিসেবে থাকে, তাকে ADMIN বানাবে
   await pool.query(
     `UPDATE users SET role = 'ADMIN' WHERE email = $1`,
     [ADMIN_EMAIL]
   );
 
-  // admin না থাকলে create করবে
   const admin = await pool.query(
     "SELECT id FROM users WHERE email = $1",
     [ADMIN_EMAIL]
@@ -388,12 +395,10 @@ async function initTables() {
 
   if (admin.rows.length === 0) {
     const hashed = await bcrypt.hash(ADMIN_PASSWORD, 12);
-
     await pool.query(
-      "INSERT INTO users (email, password, role) VALUES ($1, $2, $3)",
-      [ADMIN_EMAIL, hashed, "ADMIN"]
+      "INSERT INTO users (email, username, password, role) VALUES ($1, $2, $3, $4)",
+      [ADMIN_EMAIL, ADMIN_USERNAME, hashed, "ADMIN"]
     );
-
     console.log(`Created admin user: ${ADMIN_EMAIL}`);
   }
 
@@ -404,7 +409,6 @@ async function initTables() {
 
 function toCamel(row) {
   if (!row) return row;
-
   return Object.fromEntries(
     Object.entries(row).map(([key, value]) => [
       key.replace(/_([a-z])/g, (_, c) => c.toUpperCase()),
@@ -421,7 +425,6 @@ function mapId(row) {
 
 function mapPhone(row) {
   const phone = toCamel(row);
-
   return {
     ...phone,
     id: String(phone.id),
@@ -441,11 +444,13 @@ function mapPhone(row) {
   };
 }
 
+// ✅ FIXED: signToken - now includes username
 function signToken(user) {
   return jwt.sign(
     {
       id: user.id,
       email: user.email,
+      username: user.username || "",
       role: user.role,
       isAdmin: user.role === "ADMIN",
     },
@@ -456,15 +461,12 @@ function signToken(user) {
 
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
-
   if (!authHeader) {
     return res.status(401).json({ error: "No token" });
   }
-
   const token = authHeader.startsWith("Bearer ")
     ? authHeader.slice(7)
     : authHeader;
-
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
@@ -477,7 +479,6 @@ function verifyAdmin(req, res, next) {
   if (!req.user?.isAdmin && req.user?.role !== "ADMIN") {
     return res.status(403).json({ error: "Access denied. Not admin." });
   }
-
   next();
 }
 
@@ -499,60 +500,56 @@ app.get("/test", async (req, res) => {
 // ================= AUTH =================
 
 app.post("/register", async (req, res) => {
-  const { email, password } = req.body;
-
+  const { email, username, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password required" });
   }
-
   try {
     const hashedPassword = await bcrypt.hash(password, 12);
-
     await pool.query(
-      "INSERT INTO users (email, password, role) VALUES ($1, $2, $3)",
-      [email, hashedPassword, "USER"]
+      "INSERT INTO users (email, username, password, role) VALUES ($1, $2, $3, $4)",
+      [email, username || "", hashedPassword, "USER"]
     );
-
     res.json({ message: "User registered securely ✅" });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "User already exists" });
     }
-
     console.error(err.message);
     res.status(500).json({ error: "Error saving user" });
   }
 });
 
+// ✅ FIXED: Login - now works with both email and username
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
-
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password required" });
   }
-
   try {
+    // Email OR Username diye login korte parbe
     const result = await pool.query(
-      "SELECT * FROM users WHERE email = $1",
+      "SELECT * FROM users WHERE email = $1 OR username = $1",
       [email]
     );
-
     const user = result.rows[0];
-
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
-
     const isMatch = await bcrypt.compare(password, user.password);
-
     if (!isMatch) {
       return res.status(401).json({ error: "Wrong password" });
     }
-
     res.json({
       message: "Login successful ✅",
       token: signToken(user),
       isAdmin: user.role === "ADMIN",
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username || "",
+        role: user.role,
+      },
     });
   } catch (err) {
     console.error(err.message);
@@ -560,20 +557,161 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.get("/profile", verifyToken, (req, res) => {
-  res.json({
-    message: "Protected data accessed",
-    user: req.user,
-  });
+app.get("/profile", verifyToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, email, username, role, created_at FROM users WHERE id = $1",
+      [req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    const user = result.rows[0];
+    res.json({
+      message: "Protected data accessed",
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username || "",
+        role: user.role,
+        createdAt: user.created_at,
+      },
+    });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Profile fetch error" });
+  }
 });
+
+// =====================================================
+// ✅✅✅ NEW: PROFILE UPDATE - এটাই MAIN FIX ✅✅✅
+// =====================================================
+
+app.put("/api/profile/update", verifyToken, async (req, res) => {
+  const { email, username, newPassword, currentPassword } = req.body;
+
+  try {
+    // Step 1: আগের user data আনো
+    const userResult = await pool.query(
+      "SELECT * FROM users WHERE id = $1",
+      [req.user.id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const currentUser = userResult.rows[0];
+
+    // Step 2: Current password verify করো
+    if (!currentPassword) {
+      return res.status(400).json({ error: "Current password is required" });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, currentUser.password);
+    if (!isMatch) {
+      return res.status(401).json({ error: "Current password is wrong ❌" });
+    }
+
+    // Step 3: নতুন email already আছে কিনা check করো
+    if (email && email !== currentUser.email) {
+      const emailExists = await pool.query(
+        "SELECT id FROM users WHERE email = $1 AND id != $2",
+        [email, req.user.id]
+      );
+      if (emailExists.rows.length > 0) {
+        return res.status(409).json({ error: "This email is already taken" });
+      }
+    }
+
+    // Step 4: নতুন username already আছে কিনা check করো
+    if (username && username !== currentUser.username) {
+      const usernameExists = await pool.query(
+        "SELECT id FROM users WHERE username = $1 AND id != $2",
+        [username, req.user.id]
+      );
+      if (usernameExists.rows.length > 0) {
+        return res
+          .status(409)
+          .json({ error: "This username is already taken" });
+      }
+    }
+
+    // Step 5: Update values prepare করো
+    const updatedEmail = email || currentUser.email;
+    const updatedUsername =
+      username !== undefined ? username : currentUser.username || "";
+
+    // ✅ PASSWORD HASH - এটাই MAIN FIX!
+    let updatedPassword = currentUser.password;
+    if (newPassword && newPassword.trim() !== "") {
+      updatedPassword = await bcrypt.hash(newPassword, 12);
+    }
+
+    // Step 6: Database update করো
+    const updated = await pool.query(
+      `UPDATE users 
+       SET email = $1, username = $2, password = $3 
+       WHERE id = $4 
+       RETURNING id, email, username, role, created_at`,
+      [updatedEmail, updatedUsername, updatedPassword, req.user.id]
+    );
+
+    const updatedUser = updated.rows[0];
+
+    // ✅ Step 7: নতুন TOKEN তৈরি করো - এটাও IMPORTANT!
+    const newToken = signToken(updatedUser);
+
+    res.json({
+      message: "Profile updated successfully ✅",
+      token: newToken,
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        username: updatedUser.username || "",
+        role: updatedUser.role,
+      },
+    });
+  } catch (err) {
+    console.error("Profile update error:", err.message);
+    res.status(500).json({ error: "Profile update failed" });
+  }
+});
+
+// =====================================================
+// ✅✅✅ NEW: ADMIN - force password reset (optional)
+// =====================================================
+
+app.put(
+  "/api/admin/reset-password/:userId",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { newPassword } = req.body;
+    if (!newPassword) {
+      return res.status(400).json({ error: "New password required" });
+    }
+
+    try {
+      const hashedPassword = await bcrypt.hash(newPassword, 12);
+      await pool.query("UPDATE users SET password = $1 WHERE id = $2", [
+        hashedPassword,
+        req.params.userId,
+      ]);
+      res.json({ message: "Password reset successfully ✅" });
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).json({ error: "Password reset failed" });
+    }
+  }
+);
 
 // ================= ADMIN USERS =================
 
 app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   const users = await pool.query(
-    "SELECT id, email, role, created_at FROM users ORDER BY id DESC"
+    "SELECT id, email, username, role, created_at FROM users ORDER BY id DESC"
   );
-
   res.json(users.rows);
 });
 
@@ -608,14 +746,26 @@ app.get("/api/public/bootstrap", async (req, res) => {
       LEFT JOIN brands ON brands.id = phones.brand_id
       ORDER BY phones.created_at DESC
     `),
-    pool.query("SELECT * FROM articles WHERE status = 'published' ORDER BY created_at DESC"),
-    pool.query("SELECT * FROM pages WHERE status = 'published' ORDER BY created_at DESC"),
-    pool.query("SELECT * FROM ads WHERE active = true ORDER BY created_at DESC"),
-    pool.query("SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC"),
+    pool.query(
+      "SELECT * FROM articles WHERE status = 'published' ORDER BY created_at DESC"
+    ),
+    pool.query(
+      "SELECT * FROM pages WHERE status = 'published' ORDER BY created_at DESC"
+    ),
+    pool.query(
+      "SELECT * FROM ads WHERE active = true ORDER BY created_at DESC"
+    ),
+    pool.query(
+      "SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC"
+    ),
     pool.query("SELECT * FROM filter_options ORDER BY id ASC"),
-    pool.query("SELECT * FROM menu_items ORDER BY sort_order ASC, id ASC"),
+    pool.query(
+      "SELECT * FROM menu_items ORDER BY sort_order ASC, id ASC"
+    ),
     pool.query("SELECT * FROM submenu_items ORDER BY id ASC"),
-    pool.query("SELECT * FROM carousel_slides WHERE active = true ORDER BY sort_order ASC, id ASC"),
+    pool.query(
+      "SELECT * FROM carousel_slides WHERE active = true ORDER BY sort_order ASC, id ASC"
+    ),
     pool.query("SELECT * FROM page_visits"),
   ]);
 
@@ -648,26 +798,21 @@ app.get("/api/public/bootstrap", async (req, res) => {
       slug: row.slug,
       logoUrl: row.logo_url || "",
     })),
-
     phones: phones.rows.map(mapPhone),
-
     articles: articles.rows.map((row) => ({
       ...mapId(row),
       imageUrl: row.image_url || "",
     })),
-
     pages: pages.rows.map((row) => ({
       ...mapId(row),
       showInFooter: row.show_in_footer,
       showInHeader: row.show_in_header,
     })),
-
     ads: ads.rows.map((row) => ({
       ...mapId(row),
       imageUrl: row.image_url || "",
       adCode: row.ad_code || "",
     })),
-
     filters: filterGroups.rows.map((row) => ({
       id: String(row.id),
       name: row.name,
@@ -676,7 +821,6 @@ app.get("/api/public/bootstrap", async (req, res) => {
       order: row.sort_order,
       options: optionsByGroup[String(row.id)] || [],
     })),
-
     menuItems: menuItems.rows.map((row) => ({
       id: String(row.id),
       title: row.title,
@@ -686,7 +830,6 @@ app.get("/api/public/bootstrap", async (req, res) => {
       order: row.sort_order,
       submenus: submenusByMenu[String(row.id)] || [],
     })),
-
     carouselSlides: carouselSlides.rows.map((row) => ({
       id: String(row.id),
       title: row.title,
@@ -697,7 +840,6 @@ app.get("/api/public/bootstrap", async (req, res) => {
       active: row.active,
       order: row.sort_order,
     })),
-
     pageVisits: visits.rows.map((row) => ({
       pageId: String(row.page_id),
       visits: row.visits,
@@ -710,7 +852,6 @@ app.get("/api/public/bootstrap", async (req, res) => {
 
 app.get("/api/brands", async (req, res) => {
   const rows = await pool.query("SELECT * FROM brands ORDER BY name ASC");
-
   res.json(
     rows.rows.map((row) => ({
       id: String(row.id),
@@ -723,23 +864,19 @@ app.get("/api/brands", async (req, res) => {
 
 app.post("/api/brands", verifyToken, verifyAdmin, async (req, res) => {
   const { name, slug, logoUrl } = req.body;
-
   const created = await pool.query(
     "INSERT INTO brands (name, slug, logo_url) VALUES ($1, $2, $3) RETURNING *",
     [name, slug, logoUrl || null]
   );
-
   res.json(mapId(created.rows[0]));
 });
 
 app.put("/api/brands/:id", verifyToken, verifyAdmin, async (req, res) => {
   const { name, slug, logoUrl } = req.body;
-
   const updated = await pool.query(
     "UPDATE brands SET name=$1, slug=$2, logo_url=$3, updated_at=NOW() WHERE id=$4 RETURNING *",
     [name, slug, logoUrl || null, req.params.id]
   );
-
   res.json(mapId(updated.rows[0]));
 });
 
@@ -760,7 +897,6 @@ app.get("/api/phones", async (req, res) => {
     LEFT JOIN brands ON brands.id = phones.brand_id
     ORDER BY phones.created_at DESC
   `);
-
   res.json(rows.rows.map(mapPhone));
 });
 
@@ -777,14 +913,11 @@ app.post("/api/phones", verifyToken, verifyAdmin, async (req, res) => {
     specs,
     rating,
   } = req.body;
-
   const created = await pool.query(
-    `
-    INSERT INTO phones 
+    `INSERT INTO phones 
     (name, brand_id, price, original_price, image_url, images, status, type, specs, rating)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-    RETURNING *
-    `,
+    RETURNING *`,
     [
       name,
       brandId || null,
@@ -798,7 +931,6 @@ app.post("/api/phones", verifyToken, verifyAdmin, async (req, res) => {
       rating || 0,
     ]
   );
-
   res.json(mapPhone(created.rows[0]));
 });
 
@@ -815,24 +947,13 @@ app.put("/api/phones/:id", verifyToken, verifyAdmin, async (req, res) => {
     specs,
     rating,
   } = req.body;
-
   const updated = await pool.query(
-    `
-    UPDATE phones 
-    SET name=$1,
-        brand_id=$2,
-        price=$3,
-        original_price=$4,
-        image_url=$5,
-        images=$6,
-        status=$7,
-        type=$8,
-        specs=$9,
-        rating=$10,
-        updated_at=NOW()
+    `UPDATE phones 
+    SET name=$1, brand_id=$2, price=$3, original_price=$4, 
+        image_url=$5, images=$6, status=$7, type=$8, 
+        specs=$9, rating=$10, updated_at=NOW()
     WHERE id=$11
-    RETURNING *
-    `,
+    RETURNING *`,
     [
       name,
       brandId || null,
@@ -847,7 +968,6 @@ app.put("/api/phones/:id", verifyToken, verifyAdmin, async (req, res) => {
       req.params.id,
     ]
   );
-
   res.json(mapPhone(updated.rows[0]));
 });
 
@@ -860,39 +980,52 @@ app.delete("/api/phones/:id", verifyToken, verifyAdmin, async (req, res) => {
 
 function simpleCrud(path, table, columns) {
   app.get(`/api/${path}`, async (req, res) => {
-    const rows = await pool.query(`SELECT * FROM ${table} ORDER BY created_at DESC`);
+    const rows = await pool.query(
+      `SELECT * FROM ${table} ORDER BY created_at DESC`
+    );
     res.json(rows.rows.map(mapId));
   });
 
   app.post(`/api/${path}`, verifyToken, verifyAdmin, async (req, res) => {
-    const values = columns.map((col) => req.body[col.camel] ?? col.default ?? null);
+    const values = columns.map(
+      (col) => req.body[col.camel] ?? col.default ?? null
+    );
     const names = columns.map((col) => col.db).join(", ");
-    const placeholders = columns.map((_, index) => `$${index + 1}`).join(", ");
-
+    const placeholders = columns
+      .map((_, index) => `$${index + 1}`)
+      .join(", ");
     const created = await pool.query(
       `INSERT INTO ${table} (${names}) VALUES (${placeholders}) RETURNING *`,
       values
     );
-
     res.json(mapId(created.rows[0]));
   });
 
   app.put(`/api/${path}/:id`, verifyToken, verifyAdmin, async (req, res) => {
-    const values = columns.map((col) => req.body[col.camel] ?? col.default ?? null);
-    const setSql = columns.map((col, index) => `${col.db}=$${index + 1}`).join(", ");
-
+    const values = columns.map(
+      (col) => req.body[col.camel] ?? col.default ?? null
+    );
+    const setSql = columns
+      .map((col, index) => `${col.db}=$${index + 1}`)
+      .join(", ");
     const updated = await pool.query(
-      `UPDATE ${table} SET ${setSql}, updated_at=NOW() WHERE id=$${columns.length + 1} RETURNING *`,
+      `UPDATE ${table} SET ${setSql}, updated_at=NOW() WHERE id=$${
+        columns.length + 1
+      } RETURNING *`,
       [...values, req.params.id]
     );
-
     res.json(mapId(updated.rows[0]));
   });
 
-  app.delete(`/api/${path}/:id`, verifyToken, verifyAdmin, async (req, res) => {
-    await pool.query(`DELETE FROM ${table} WHERE id=$1`, [req.params.id]);
-    res.json({ ok: true });
-  });
+  app.delete(
+    `/api/${path}/:id`,
+    verifyToken,
+    verifyAdmin,
+    async (req, res) => {
+      await pool.query(`DELETE FROM ${table} WHERE id=$1`, [req.params.id]);
+      res.json({ ok: true });
+    }
+  );
 }
 
 // ================= ARTICLES =================
@@ -946,11 +1079,9 @@ app.get("/api/filters", async (req, res) => {
   const groups = await pool.query(
     "SELECT * FROM filter_groups ORDER BY sort_order ASC, id ASC"
   );
-
   const options = await pool.query(
     "SELECT * FROM filter_options ORDER BY id ASC"
   );
-
   res.json(
     groups.rows.map((group) => ({
       id: String(group.id),
@@ -969,63 +1100,58 @@ app.get("/api/filters", async (req, res) => {
 
 app.post("/api/filters", verifyToken, verifyAdmin, async (req, res) => {
   const { name, type = "tags", enabled = true, options = [] } = req.body;
-
   const group = await pool.query(
     "INSERT INTO filter_groups (name, type, enabled) VALUES ($1,$2,$3) RETURNING *",
     [name, type, enabled]
   );
-
   for (const option of options) {
     await pool.query(
       "INSERT INTO filter_options (filter_group_id, label) VALUES ($1,$2)",
       [group.rows[0].id, option.label || option]
     );
   }
-
   res.json(mapId(group.rows[0]));
 });
 
 app.put("/api/filters/:id", verifyToken, verifyAdmin, async (req, res) => {
   const { name, type = "tags", enabled = true, options = [] } = req.body;
-
   const group = await pool.query(
     "UPDATE filter_groups SET name=$1, type=$2, enabled=$3, updated_at=NOW() WHERE id=$4 RETURNING *",
     [name, type, enabled, req.params.id]
   );
-
   await pool.query("DELETE FROM filter_options WHERE filter_group_id=$1", [
     req.params.id,
   ]);
-
   for (const option of options) {
     await pool.query(
       "INSERT INTO filter_options (filter_group_id, label) VALUES ($1,$2)",
       [req.params.id, option.label || option]
     );
   }
-
   res.json(mapId(group.rows[0]));
 });
 
-app.delete("/api/filters/:id", verifyToken, verifyAdmin, async (req, res) => {
-  await pool.query("DELETE FROM filter_groups WHERE id=$1", [req.params.id]);
-  res.json({ ok: true });
-});
+app.delete(
+  "/api/filters/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    await pool.query("DELETE FROM filter_groups WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  }
+);
 
 // ================= VISITS =================
 
 app.post("/api/visits/:pageId", async (req, res) => {
   const visit = await pool.query(
-    `
-    INSERT INTO page_visits (page_id, visits, last_visited)
+    `INSERT INTO page_visits (page_id, visits, last_visited)
     VALUES ($1, 1, NOW())
     ON CONFLICT (page_id)
     DO UPDATE SET visits = page_visits.visits + 1, last_visited = NOW()
-    RETURNING *
-    `,
+    RETURNING *`,
     [req.params.pageId]
   );
-
   res.json(toCamel(visit.rows[0]));
 });
 
